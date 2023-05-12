@@ -1,0 +1,406 @@
+---
+title: "WGCNA Analysis"
+author: "Asad"
+date: "2023-05-12"
+output: 
+  html_document: 
+    highlight: zenburn
+    theme: journal
+---
+### Call libraries
+
+```{r}
+library(WGCNA)
+library(DESeq2)
+library(tidyverse)
+library(CorLevelPlot)
+library(gridExtra)
+library(magrittr)
+library(ggplot2)
+
+allowWGCNAThreads()
+
+setwd('E:/WGCNA')
+```
+
+### 1. Read data
+```{r}
+data<- read.csv('Counts.csv', row.names = 1)
+Sample_info<- read.csv('Sample_info.csv', row.names = 1)
+```
+
+### 2. Quality control
+#### Step1: Detect outlier genes with WGCNA package
+```{r}
+gg<- goodSamplesGenes(t(data))
+summary(gg)
+gg$allOK
+```
+
+#Since it indicates tat all genes are not good genes let's quantify the outlier genes
+#We'll do it for samples as well
+```{r}
+table(gg$goodGenes)
+table(gg$goodSamples)
+```
+#Around 3500 outlier genes but no outlier samples. Let's remove those genes
+```{r}
+data<- data[gg$goodGenes=='TRUE',]
+```
+
+#### Step2: Identify outlier samples with hierachical clustering
+```{r}
+htree <- hclust(dist(t(data)), method = "average")
+plot(htree)
+```
+#### Step3: Identify outlier samples with PCA
+```{r}
+pca <- prcomp(t(data))
+pca.dat <- pca$x
+
+pca.var <- pca$sdev^2
+pca.var.percent <- round(pca.var/sum(pca.var)*100, digits = 2)
+
+pca.dat <- as.data.frame(pca.dat)
+
+ggplot(pca.dat, aes(PC1, PC2)) +
+  geom_point() +
+  geom_text(label = rownames(pca.dat)) +
+  labs(x = paste0('PC1: ', pca.var.percent[1], ' %'),
+       
+       y = paste0('PC2: ', pca.var.percent[2], ' %'))
+
+#N.B. We need to remove batch effect if there's any at this stage before we proceed further
+
+#In both these methods we found Sample5 is distantly related 
+#So we'll exclude them
+discard_samples<- c('Sample5')
+data.final<- data[,!colnames(data) %in% discard_samples]
+Sample_info_final<- Sample_info[!row.names(Sample_info) %in% discard_samples,]
+
+```
+
+### 4. Perform VST normalization with DESeq2 since it's a count matrix
+#N.B. FPKM or RPKM matrices need to be log transformed
+#Before performing normalization make sure if the rownames in matrix and colnames in
+#Sample info are identical
+```{r}
+all(rownames(Sample_info_final)%in%colnames(data.final)) #If present
+all(rownames(Sample_info_final)==colnames(data.final)) #If present in same order
+```
+
+#### Create deseq2 object
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = data.final,
+                              colData = Sample_info_final,
+                              design = ~ 1) #Specifying no design
+nrow(dds)
+```
+
+#### Remove samples that have <15 counts in more than 75% of the samples
+#Recommended by WGCNA
+#However, the downstream analysis with higher # of genes  will depend largely on 
+#the available ram of PC. So, we'll consider gene numbers based on our PC capacity.
+```{r}
+keep <- dds[rowSums(counts(dds) >= 15)>=39,] #75% of 52 samples is 52*0.75=39
+nrow(keep)
+```
+
+#### Perform VST transformation
+```{r}
+dds.vst<- vst(keep) 
+dds.vst<- dds.vst[1:5000,] #We reduced the # of genes to 8000 because of low RAM
+nrow(dds.vst)
+```
+
+# Get normalized counts
+```{r}
+norm.counts <- assay(dds.vst) %>% 
+  t()
+```
+
+### 5. Constructing network
+# Set softhreshold power
+```{r}
+power <- c(c(1:10), seq(from = 12, to = 50, by = 2))
+```
+
+# Set the network topology analysis function
+```{r}
+sft <- pickSoftThreshold(norm.counts,
+                         powerVector = power,
+                         networkType = "signed",
+                         verbose = 5)
+```
+
+#N.B. unsigned -> nodes with positive & negative correlation are treated equally 
+#N.B. signed -> nodes with negative correlation are considered *unconnected*, treated as zero
+```{r}
+sft.data <- sft$fitIndices
+```
+# visualization to pick power
+
+```{r}
+Plot1 <- ggplot(sft.data, aes(Power, SFT.R.sq, label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  geom_hline(yintercept = 0.8, color = 'red') +
+  labs(x = 'Power', y = 'Scale free topology model fit, signed R^2') +
+  theme_classic()
+
+
+Plot2 <- ggplot(sft.data, aes(Power, mean.k., label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  labs(x = 'Power', y = 'Mean Connectivity') +
+  theme_classic()
+
+
+grid.arrange(Plot1, Plot2, nrow = 2)
+```
+
+# convert matrix to numeric and assign power
+```{r}
+norm.counts[] <- sapply(norm.counts, as.numeric)
+soft_power <- 14
+temp_cor <- cor
+cor <- WGCNA::cor
+```
+
+# Estimate w.r.t blocksize memory depends on available ram of PC
+```{r}
+bwnet <- blockwiseModules(norm.counts,
+                          maxBlockSize = 5000,
+                          TOMType = "signed",
+                          power = soft_power,
+                          mergeCutHeight = 0.25,
+                          numericLabels = FALSE,
+                          randomSeed = 1234,
+                          verbose = 3)
+cor <- temp_cor
+```
+
+### 6. Identify Module Eigengenes 
+```{r}
+module_eigengenes <- bwnet$MEs
+head(module_eigengenes)
+```
+# Check the number of genes for each module
+```{r}
+table(bwnet$colors)
+```
+# Plot the dendrogram and the module colors before and after merging underneath
+```{r}
+plotDendroAndColors(bwnet$dendrograms[[1]], cbind(bwnet$unmergedColors, bwnet$colors),
+                    c("unmerged", "merged"),
+                    dendroLabels = FALSE,
+                    addGuide = TRUE,
+                    hang= 0.03,
+                    guideHang = 0.05)
+```
+
+# grey module = all genes that doesn't fall into other modules were assigned to the grey module
+
+
+### 7. Extract genes and their associated color modules and save them
+```{r}
+mergedColors<- labels2colors(bwnet$colors)
+module_df <- data.frame(
+  gene_id <- names(bwnet$colors),
+  colors <- labels2colors(bwnet$colors)
+)
+
+module_df[1:5,]
+
+write_delim(module_df,
+            file = "gene_modules.txt",
+            delim = "\t")
+```
+
+### 8. Merging and clustering modules from eigengenes
+# Calculate eigengenes
+```{r}
+MEList <- moduleEigengenes(norm.counts, colors = mergedColors)
+MEs <- MEList$eigengenes
+```
+
+# Calculate dissimilarity of module eigengenes
+```{r}
+MEDiss <- 1-cor(MEs)
+METree <- hclust(as.dist(MEDiss), method = "average")
+```
+# Plot the result
+```{r}
+plot(METree, main = "Clustering of Module eigengenes",
+     xlab = "", sub = "")
+```
+
+### 9. Show the correlation between modules and each sample
+# Get Module Eigengenes per cluster
+```{r}
+MEs0 <- moduleEigengenes(norm.counts, mergedColors)$eigengenes
+```
+
+#Reorder modules so similar modules are next to each other
+```{r}
+MEs0 <- orderMEs(MEs0)
+module_order <- names(MEs0) %>% gsub("ME","", .)
+```
+
+# Add the treatment names
+```{r}
+MEs0$treatment <- row.names(MEs0)
+```
+
+# Tidy & plot data
+```{r}
+mME = MEs0 %>%
+  pivot_longer(-treatment) %>%
+  mutate(
+    name = gsub("ME", "", name),
+    name = factor(name, levels = module_order) 
+  )
+
+mME %>% ggplot(., aes(x=treatment, y=name, fill=value)) +
+  geom_tile() +
+  theme_bw() + 
+  scale_fill_gradient2(
+    low = "blue", 
+    high = "red", 
+    mid = "white", 
+    midpoint = 0, 
+    limit = c(-1,1)) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Module-trait Relationships", y = "Modules", fill="corr")
+```
+
+### 10. Showing gene expression level in specific modules
+```{r}
+
+modules_of_interest = c("green", "turquoise", "red")
+```
+
+# Pull out list of genes in that module
+```{r}
+submod = module_df %>%
+  subset(colors %in% modules_of_interest)
+
+row.names(module_df) = module_df$gene_id
+```
+
+# Get normalized expression for those genes
+```{r}
+norm.counts[1:5,1:10]
+norm.exprs<- data.frame(t(norm.counts)) 
+norm.exprs$gene_id<- row.names(norm.exprs) 
+norm.exprs<- norm.exprs %>% select(gene_id,everything())
+subexpr <- norm.exprs[submod$gene_id,]
+ 
+submod_df <- data.frame(subexpr) %>%
+  mutate(
+    gene_id = row.names(.)
+  ) %>% 
+  pivot_longer(-gene_id) %>%
+  mutate(
+    module = module_df[gene_id,]$colors
+  )
+
+submod_df %>% ggplot(., aes(x=name, y=value, group=gene_id, colour=module)) +
+  geom_line(alpha=0.2) + 
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90)
+  ) +
+  facet_grid(rows = vars(module)) +
+  labs(x = "Treatment",
+       y = "Normalized expression") + 
+  scale_color_manual(values = c("lightgreen","red","turquoise"))
+```
+### 11. Finding the association between module and traits
+# Prepare and manipulate data for association analysis
+# Converting categorical variable into binary group variables
+```{r}
+type <- Sample_info_final %>% 
+        mutate(type = ifelse(grepl('Lung cancer', Group), 1, 0)) %>% 
+        select(4)
+```
+
+```{r}
+Sample_info_final$Status <- factor(Sample_info_final$Status, 
+                                   levels = c("None", "Newly diagnosed", 
+                                   "Post Chemotherapy", "On Doxorubicin"))
+```
+
+
+```{r}
+Status<- binarizeCategoricalColumns(Sample_info_final$Status,
+                                           includePairwise = FALSE,
+                                           includeLevelVsAll = TRUE,
+                                           minCount = 1)
+
+
+Status.final<- cbind(type, Status)
+```
+
+# Define numbers of genes and samples and draw correlation
+```{r}
+nSamples <- nrow(norm.counts)
+nGenes <- ncol(norm.counts)
+status.module.corr <- cor(module_eigengenes, Status.final, use = 'p')
+status.module.corr.pvals <- corPvalueStudent(status.module.corr , nSamples)
+nrow(module_eigengenes)
+```
+
+####  Visualize module-trait association as a heatmap
+```{r}
+heatmap.data <- merge(module_eigengenes, Status.final, by = 'row.names')
+
+head(heatmap.data)
+
+heatmap.data <- heatmap.data %>% 
+   column_to_rownames(var = 'Row.names')
+
+CorLevelPlot(heatmap.data,
+             x = names(heatmap.data)[9:12],
+             y = names(heatmap.data)[1:11],
+             col = c("blue1", "green", "pink", "red"))
+
+
+
+module.gene.mapping <- as.data.frame(bwnet$colors)
+module.gene.mapping %>% 
+  filter(`bwnet$colors` == 'blue') %>% 
+  rownames()
+
+```
+
+### 12. Identifying significant genes against different features of data
+#### Calculating the module membership and the associated p-values
+# The module membership/intramodular connectivity is calculated as the correlation of the eigengene and the gene expression profile. 
+# This quantifies the similarity of all genes on the array to every module.
+```{r}
+module.membership.measure <- cor(module_eigengenes, norm.counts, use = 'p')
+module.membership.measure.pvals <- corPvalueStudent(module.membership.measure, nSamples)
+
+module.membership.measure.pvals[1:5,1:10]
+```
+
+#### Calculating the gene significance and associated p-values against a particular trait
+```{r}
+gene.signf.corr <- cor(norm.counts, Status.final$'data.Post Chemotherapy.vs.all', use = 'p')
+gene.signf.corr.pvals <- corPvalueStudent(gene.signf.corr, nSamples)
+```
+# Sub-setting based on significant association: X1:corr, X2:pval
+```{r}
+Sig_chemo<-data.frame(cbind(gene.signf.corr, gene.signf.corr.pvals))
+Sig_chemo_final<- filter(Sig_chemo, Sig_chemo$X1> 0.3 | Sig_chemo$X1< -0.3
+                         & Sig_chemo$X2<0.05)  
+
+write.csv(Sig_chemo_final, 'sig_genes_chemo.csv')
+```
+
+
+
+
+
+
